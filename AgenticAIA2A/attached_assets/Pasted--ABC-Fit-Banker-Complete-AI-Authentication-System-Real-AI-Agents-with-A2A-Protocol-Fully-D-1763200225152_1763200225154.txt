@@ -1,0 +1,1786 @@
+"""
+ABC+ Fit Banker - Complete AI Authentication System
+Real AI Agents with A2A Protocol - Fully Dynamic
+Main Agent = Boss, Specialist Agents = Employees
+Using OpenRouter AI
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional, Dict, List
+import json
+from datetime import datetime
+import asyncpg
+import hashlib
+import secrets
+from openai import AsyncOpenAI
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenRouter AI client
+client = AsyncOpenAI(
+    api_key="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",
+    base_url="https://openrouter.ai/api/v1"
+)
+
+# Initialize FastAPI
+app = FastAPI(title="ABC+ Fit Banker AI System")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Configuration - Use working connection
+DATABASE_URL = "postgresql://postgres:Nalini2004@localhost:5432/postgres"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_USER = "postgres"
+DB_PASSWORD = "Nalini2004"
+DB_NAME = "postgres"
+
+# =====================================================
+# A2A PROTOCOL
+# =====================================================
+
+class A2AMessage:
+    def __init__(self, sender: str, receiver: str, content: str, 
+                 message_type: str = "request", metadata: Dict = None):
+        self.sender = sender
+        self.receiver = receiver
+        self.content = content
+        self.message_type = message_type
+        self.timestamp = datetime.utcnow().isoformat()
+        self.metadata = metadata or {}
+        self.message_id = f"{sender}-{int(datetime.utcnow().timestamp() * 1000)}"
+    
+    def to_dict(self) -> Dict:
+        return {
+            "message_id": self.message_id,
+            "sender": self.sender,
+            "receiver": self.receiver,
+            "timestamp": self.timestamp,
+            "type": self.message_type,
+            "content": self.content,
+            "metadata": self.metadata
+        }
+
+class A2AChannel:
+    def __init__(self):
+        self.agent_cards: Dict[str, Dict] = {}
+        self.message_queue: Dict[str, List[A2AMessage]] = {}
+        self.conversation_history: Dict[str, List[Dict]] = {}  # Track agent conversations
+    
+    def register_agent(self, agent_id: str, card: Dict):
+        self.agent_cards[agent_id] = card
+        self.message_queue[agent_id] = []
+        self.conversation_history[agent_id] = []
+        print(f"✓ Registered: {card['name']}")
+    
+    async def send(self, message: A2AMessage):
+        if message.receiver in self.message_queue:
+            self.message_queue[message.receiver].append(message)
+            # Track conversation
+            self.conversation_history[message.receiver].append({
+                "from": message.sender,
+                "to": message.receiver,
+                "content": message.content,
+                "timestamp": message.timestamp,
+                "metadata": message.metadata
+            })
+            print(f"📨 A2A: {message.sender} → {message.receiver}")
+    
+    def get_messages(self, agent_id: str) -> List[A2AMessage]:
+        messages = self.message_queue.get(agent_id, [])
+        self.message_queue[agent_id] = []
+        return messages
+    
+    def get_conversation_context(self, agent_id: str) -> str:
+        """Get conversation history for agent context"""
+        history = self.conversation_history.get(agent_id, [])
+        if not history:
+            return "No previous agent conversations."
+        
+        context = "AGENT CONVERSATION HISTORY:\n"
+        for msg in history[-5:]:  # Last 5 agent messages
+            context += f"{msg['from']} → {msg['to']}: {msg['content']}\n"
+        return context
+
+a2a_channel = A2AChannel()
+
+# =====================================================
+# CHAT TRANSCRIPT - Live conversation memory
+# =====================================================
+
+chat_transcripts = {}  # session_id -> list of messages
+
+def add_to_transcript(session_id: str, role: str, message: str, agent: str = None):
+    """Add message to chat transcript for context preservation"""
+    if not session_id:
+        session_id = "guest"
+    
+    if session_id not in chat_transcripts:
+        chat_transcripts[session_id] = []
+    
+    chat_transcripts[session_id].append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "role": role,
+        "message": message,
+        "agent": agent
+    })
+    
+    # Keep only last 20 messages to prevent memory issues
+    if len(chat_transcripts[session_id]) > 20:
+        chat_transcripts[session_id] = chat_transcripts[session_id][-20:]
+
+def get_chat_context(session_id: str) -> str:
+    """Get formatted chat history for AI context"""
+    if not session_id:
+        session_id = "guest"
+    
+    if session_id not in chat_transcripts:
+        return "No previous conversation."
+    
+    context = "PREVIOUS CONVERSATION:\n"
+    for msg in chat_transcripts[session_id][-10:]:  # Last 10 messages
+        role = "USER" if msg["role"] == "user" else "AI"
+        agent_info = f" ({msg['agent']})" if msg.get("agent") else ""
+        context += f"{role}{agent_info}: {msg['message']}\n"
+    
+    return context
+
+# =====================================================
+# DATABASE
+# =====================================================
+
+async def get_db():
+    """Get database connection using env variables"""
+    return await asyncpg.connect(DATABASE_URL)
+
+async def init_db():
+    """Initialize database tables"""
+    conn = await get_db()
+    try:
+        # Drop existing tables if they exist (for clean restart)
+        await conn.execute('DROP TABLE IF EXISTS sessions CASCADE')
+        await conn.execute('DROP TABLE IF EXISTS user_profiles CASCADE')
+        await conn.execute('DROP TABLE IF EXISTS users CASCADE')
+
+        # Create users table first
+        await conn.execute('''
+            CREATE TABLE users (
+                user_id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                phone VARCHAR(20) UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                name VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Create user_profiles table
+        await conn.execute('''
+            CREATE TABLE user_profiles (
+                profile_id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
+                age INTEGER,
+                gender VARCHAR(50),
+                height_cm FLOAT,
+                weight_kg FLOAT,
+                activity_level VARCHAR(50),
+                diet_preference VARCHAR(100),
+                health_goals TEXT[],
+                health_conditions TEXT[],
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Create sessions table
+        await conn.execute('''
+            CREATE TABLE sessions (
+                session_id VARCHAR(255) PRIMARY KEY,
+                user_id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP
+            )
+        ''')
+
+        print("✓ Database initialized successfully")
+        print(f"✓ Connected to: {DB_NAME}@{DB_HOST}:{DB_PORT}")
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        raise
+    finally:
+        await conn.close()
+
+async def get_user_from_session(session_id: str) -> Optional[Dict]:
+    """Get user info from session"""
+    if not session_id:
+        return None
+    
+    conn = await get_db()
+    try:
+        user = await conn.fetchrow('''
+            SELECT s.user_id, u.name, u.email,
+                   EXISTS(SELECT 1 FROM user_profiles WHERE user_id = s.user_id) as has_profile
+            FROM sessions s
+            JOIN users u ON s.user_id = u.user_id
+            WHERE s.session_id = $1 AND s.expires_at > NOW()
+        ''', session_id)
+        
+        if user:
+            return {
+                "user_id": user["user_id"],
+                "name": user["name"],
+                "email": user["email"],
+                "has_profile": user["has_profile"],
+                "authenticated": True
+            }
+        return None
+    finally:
+        await conn.close()
+
+# =====================================================
+# MAIN AGENT (THE BOSS)
+# =====================================================
+
+class MainAgent:
+    """Main coordinator - The Boss that manages all specialist agents"""
+    
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "main_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the MAIN BOSS AGENT for ABC+ Fit Banker.
+
+YOUR ROLE AS THE BOSS:
+- You are the ONLY agent that talks directly to users
+- You manage a team of specialist agents (employees)
+- You understand user intent and delegate tasks via A2A messages
+- You collect responses from specialists and present them to users
+- You maintain conversation flow and context using chat history
+
+CHAT CONTEXT:
+{chat_context}
+
+YOUR TEAM (Specialist Agents):
+1. registration_agent - Handles new account creation
+2. login_agent - Handles authentication
+3. profile_agent - Manages health profiles (create/update/view)
+4. health_agent - Answers health, nutrition, fitness questions
+5. logout_agent - Handles logout requests
+
+AUTHENTICATION AWARENESS:
+- User session includes: {session_info}
+- If user_id exists → user is LOGGED IN
+- If no user_id → user is NOT logged in
+
+CRITICAL AUTHENTICATION RULES:
+🚨 NEVER give health advice directly - ALWAYS route to health_agent
+🚨 Health Agent and Profile Agent require user_id in session
+🚨 Check authentication before routing to protected agents
+
+INTELLIGENT ROUTING RULES:
+1. Registration needs (new user, signup, create account) → registration_agent
+2. Login needs (login, sign in) → login_agent
+3. Profile operations (create/update/view profile, change weight, update goals) → profile_agent
+   ⚠️ ONLY if user_id exists in session! If not, respond: "Please login first to manage your profile."
+4. Health questions (diet, nutrition, exercise, stress, sleep, fitness, protein, calories, etc.) → health_agent
+   ⚠️ ONLY if user_id exists in session! If not, respond: "I'd love to help with health advice, but you need to be logged in first. Would you like to login or create a new account?"
+5. Logout (logout, sign out, exit) → logout_agent
+6. General help/greetings → respond directly with friendly guidance
+
+AUTHENTICATION ENFORCEMENT:
+- Check session_info for "user_id" field before routing to health_agent or profile_agent
+- If user_id is missing/null, do NOT route - respond with login request instead
+- ALL health-related questions must go to health_agent (never answer directly)
+
+IMPORTANT - CONVERSATION FLOW:
+- Use chat history to understand context
+- If user provided complete info for registration/login, route immediately
+- Don't ask for info already provided in chat history
+- Complete tasks efficiently without repetitive questions
+
+DECISION FORMAT (think then respond):
+{{
+  "action": "route" | "respond",
+  "to_agent": "agent_id" (if routing),
+  "message": "message for agent or user",
+  "reasoning": "why you made this decision"
+}}
+
+PERSONALITY:
+- Warm, professional, helpful
+- Remember user context across conversation
+- Celebrate successes (login, profile creation)
+- Guide confused users patiently
+- Be efficient and don't repeat questions
+- STRICT about authentication - never bypass security
+- NEVER give health advice directly - always route to specialist
+
+Be the best boss - coordinate your team efficiently and enforce security!"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Main Boss Agent",
+            "description": "Primary coordinator managing all specialist agents",
+            "capabilities": [
+                "Direct user interaction",
+                "Intelligent task delegation",
+                "Team coordination via A2A",
+                "Context management",
+                "Response synthesis"
+            ]
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, user_message: str, session_data: Dict, session_id: str = None) -> Dict:
+        """Process user message as the boss - coordinate with team intelligently"""
+        
+        # Add user message to transcript
+        add_to_transcript(session_id, "user", user_message)
+        
+        # Build context with session info and chat history
+        session_info = json.dumps(session_data, indent=2) if session_data else "No active session"
+        chat_context = get_chat_context(session_id)
+        
+        context = f"""
+USER MESSAGE: {user_message}
+
+CURRENT SESSION:
+{session_info}
+
+CHAT HISTORY:
+{chat_context}
+
+As the MAIN BOSS AGENT, analyze this message and decide the best action.
+
+IMPORTANT: You can have multi-step conversations with your specialist agents.
+If an agent needs more info, they will ask for it, and you can continue the conversation.
+
+Analyze the message and decide what to do.
+"""
+        
+        # AI decides what to do using OpenRouter
+        response = await client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",  # Using OpenRouter's GPT-3.5
+            messages=[
+                {"role": "system", "content": self.system_prompt.format(session_info=session_info, chat_context=chat_context)},
+                {"role": "user", "content": context}
+            ],
+            temperature=0.7,
+            max_tokens=200  # Limit tokens to save credits
+        )
+        
+        decision_text = response.choices[0].message.content
+        
+        # Parse decision
+        try:
+            decision = json.loads(decision_text)
+        except:
+            decision = {"action": "respond", "message": decision_text}
+        
+        print(f"\n🧠 Main Agent Decision: {decision.get('reasoning', 'N/A')}")
+        
+        if decision["action"] == "route":
+            # Send A2A message to specialist
+            target_agent = decision["to_agent"]
+            
+            a2a_msg = A2AMessage(
+                sender=self.agent_id,
+                receiver=target_agent,
+                content=decision["message"],
+                metadata={
+                    "session": session_data,
+                    "original_user_message": user_message,
+                    "chat_context": chat_context,
+                    "session_id": session_id
+                }
+            )
+            
+            await self.channel.send(a2a_msg)
+            
+            return {
+                "routed_to": target_agent,
+                "message": decision.get("message", "Processing..."),
+                "wait_for_response": True
+            }
+        else:
+            # Direct response
+            add_to_transcript(session_id, "assistant", decision["message"], "main_agent")
+            return {
+                "response": decision["message"],
+                "from_agent": "main_agent"
+            }
+
+# =====================================================
+# REGISTRATION AGENT
+# =====================================================
+
+class RegistrationAgent:
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "registration_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the REGISTRATION SPECIALIST agent - an intelligent AI that can collaborate.
+
+YOUR JOB:
+- Collect email/phone, password, name through smart conversation
+- Validate inputs and create accounts
+- You can collaborate with other agents if needed
+- Use chat context and previous agent conversations
+- Think intelligently about what information you need
+
+SMART APPROACH:
+- Analyze chat history first - what info do you already have?
+- If user said "register" → Check what's missing and ask efficiently
+- Don't ask for info that was already provided in conversation
+- If you have complete info (email, phone, password) → Create account immediately
+- If confused about user intent, you can ask Main Agent for guidance
+- Be intelligent about the conversation flow
+
+RESPONSE FORMAT:
+{{
+  "message": "your natural conversational response",
+  "status": "collecting" | "ready" | "created" | "error",
+  "create_user": {{  // only when ready
+    "email": "...",
+    "phone": "...",
+    "password": "...",
+    "name": "..."
+  }},
+  "error": "error message if any"
+}}
+
+Example responses:
+- "Great! Let's create your account. First, what's your email address?"
+- "Perfect! Now I need a phone number for your account."
+- "Excellent! Please create a strong password (at least 8 characters)."
+- "Almost done! What's your name? (This is optional but helps personalize your experience)"
+
+Be warm and helpful!"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Registration Specialist",
+            "description": "Handles new user account creation",
+            "capabilities": ["Account creation", "Input validation", "Database insertion"],
+            "database_access": ["users"]
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, a2a_message: A2AMessage) -> str:
+        session = a2a_message.metadata.get("session", {})
+        user_msg = a2a_message.metadata.get("original_user_message", "")
+        chat_context = a2a_message.metadata.get("chat_context", "No previous conversation.")
+        session_id = a2a_message.metadata.get("session_id")
+        
+        context = f"""
+BOSS REQUEST: {a2a_message.content}
+USER SAID: {user_msg}
+SESSION: {json.dumps(session)}
+CHAT HISTORY: {chat_context}
+
+Check chat history for email, phone, password, name. If all provided, create account immediately.
+"""
+        
+        response = await client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": context}
+            ],
+            temperature=0.7,
+            max_tokens=200  # Limit tokens
+        )
+        
+        result = response.choices[0].message.content
+        
+        try:
+            decision = json.loads(result)
+        except:
+            decision = {"message": result, "status": "collecting"}
+        
+        # Handle account creation
+        if decision.get("status") == "ready" and "create_user" in decision:
+            user_data = decision["create_user"]
+            
+            try:
+                conn = await get_db()
+                password_hash = hashlib.sha256(user_data["password"].encode()).hexdigest()
+                
+                user_id = await conn.fetchval('''
+                    INSERT INTO users (email, phone, password_hash, name)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING user_id
+                ''', user_data.get("email"), user_data.get("phone"), 
+                    password_hash, user_data.get("name"))
+                
+                await conn.close()
+                
+                decision["message"] += f"\n\n✅ Account created! User ID: {user_id}\n\nNow you can login with your credentials."
+                decision["status"] = "created"
+                decision["user_id"] = user_id
+                
+            except asyncpg.exceptions.UniqueViolationError:
+                decision["message"] = "❌ This email/phone is already registered. Would you like to login instead?"
+                decision["status"] = "error"
+                decision["error"] = "duplicate"
+            except Exception as e:
+                decision["message"] = f"❌ Error: {str(e)}"
+                decision["status"] = "error"
+        
+        # Add to transcript
+        add_to_transcript(session_id, "assistant", decision["message"], "registration_agent")
+        
+        return json.dumps(decision)
+
+# =====================================================
+# LOGIN AGENT
+# =====================================================
+
+class LoginAgent:
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "login_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the LOGIN SPECIALIST agent - a smart AI that can think and collaborate.
+
+YOUR JOB:
+- Collect email/phone and password through intelligent conversation
+- Verify against database when you have complete credentials
+- Create session on success and inform Main Agent
+- You can ask Main Agent for help or clarification if needed
+- Use chat context and agent conversation history
+
+INTELLIGENT APPROACH:
+- Analyze what info you already have from chat history
+- If user just said "login" → Ask for email/phone
+- If you have email but no password → Ask for password specifically
+- If you have both → Verify immediately
+- If confused, you can send A2A message to main_agent for guidance
+- Be conversational and smart about gathering information
+
+RESPONSE FORMAT:
+{{
+  "message": "your natural conversational response",
+  "status": "collecting" | "verifying" | "success" | "failed" | "completed",
+  "verify_credentials": {{
+    "identifier": "email or phone",
+    "password": "password"
+  }},
+  "session_id": "...",
+  "user_id": 123,
+  "has_profile": true/false,
+  "collaborate_with": "agent_id" (if you need help from another agent),
+  "collaboration_message": "message for other agent"
+}}
+
+COLLABORATION:
+If you're confused or need help, you can collaborate:
+{{
+  "message": "Let me check with my colleague...",
+  "status": "collaborating",
+  "collaborate_with": "main_agent",
+  "collaboration_message": "User login attempt unclear, need guidance"
+}}
+
+Example responses:
+- "Hi! To log you in, I'll need your email or phone number. What email did you register with?"
+- "Great! Now please enter your password."
+- "Perfect! Let me verify your credentials now..."
+
+Be natural, smart, and collaborative!"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Login Specialist",
+            "description": "Authenticates users and creates sessions",
+            "capabilities": ["Credential verification", "Session management"],
+            "database_access": ["users", "sessions", "user_profiles"]
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, a2a_message: A2AMessage) -> str:
+        session = a2a_message.metadata.get("session", {})
+        user_msg = a2a_message.metadata.get("original_user_message", "")
+        chat_context = a2a_message.metadata.get("chat_context", "No previous conversation.")
+        session_id = a2a_message.metadata.get("session_id")
+        agent_history = a2a_message.metadata.get("agent_conversation_history", "No agent conversations.")
+        is_collaboration = a2a_message.metadata.get("collaboration", False)
+        
+        context = f"""
+BOSS REQUEST: {a2a_message.content}
+USER SAID: {user_msg}
+SESSION: {json.dumps(session)}
+CHAT HISTORY: {chat_context}
+AGENT CONVERSATIONS: {agent_history}
+COLLABORATION REQUEST: {is_collaboration}
+
+As a smart agent, analyze all context and decide the best approach.
+Check chat history for email/phone and password. If found, verify immediately.
+If you need help from another agent, use the collaboration format.
+"""
+        
+        response = await client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": context}
+            ],
+            temperature=0.7,
+            max_tokens=200
+        )
+        
+        result = response.choices[0].message.content
+        
+        try:
+            decision = json.loads(result)
+        except:
+            decision = {"message": result, "status": "collecting"}
+        
+        # Handle verification
+        if decision.get("status") == "verifying" and "verify_credentials" in decision:
+            creds = decision["verify_credentials"]
+            
+            # Check if credentials are valid
+            if not creds.get("identifier") or not creds.get("password"):
+                decision["status"] = "failed"
+                decision["message"] = "Please provide both email/phone and password to login."
+                add_to_transcript(session_id, "assistant", decision["message"], "login_agent")
+                return json.dumps(decision)
+            
+            try:
+                conn = await get_db()
+                password_hash = hashlib.sha256(creds["password"].encode()).hexdigest()
+                
+                user = await conn.fetchrow('''
+                    SELECT user_id, email, name FROM users
+                    WHERE (email = $1 OR phone = $1) AND password_hash = $2
+                ''', creds["identifier"], password_hash)
+                
+                if user:
+                    # LIVE UPDATE: Found user, creating session
+                    print(f"📡 LIVE UPDATE: ✅ User found! Creating secure session...")
+                    
+                    new_session_id = secrets.token_urlsafe(32)
+                    await conn.execute('''
+                        INSERT INTO sessions (session_id, user_id, expires_at)
+                        VALUES ($1, $2, NOW() + INTERVAL '7 days')
+                    ''', new_session_id, user["user_id"])
+                    
+                    # LIVE UPDATE: Checking profile
+                    print(f"📡 LIVE UPDATE: 🔄 Checking health profile...")
+                    
+                    profile = await conn.fetchval('''
+                        SELECT profile_id FROM user_profiles WHERE user_id = $1
+                    ''', user["user_id"])
+                    
+                    await conn.close()
+                    
+                    decision["status"] = "success"
+                    decision["session_id"] = new_session_id
+                    decision["user_id"] = user["user_id"]
+                    decision["has_profile"] = profile is not None
+                    
+                    # LIVE SUCCESS MESSAGE
+                    decision["message"] = f"🎉 Login successful! Welcome back, {user['name']}!\n\n✅ Session created securely\n✅ Account verified"
+                    if not profile:
+                        decision["message"] += "\n\n💡 I notice you don't have a health profile yet. Would you like me to help you create one for personalized health advice?"
+                    else:
+                        decision["message"] += "\n\n🏥 Your health profile is active - I'm ready to help with personalized advice!"
+                else:
+                    decision["status"] = "failed"
+                    decision["message"] = "❌ Invalid credentials. Please check your email and password, or register if you're new."
+                
+            except Exception as e:
+                decision["status"] = "failed"
+                decision["message"] = f"❌ Login error: {str(e)}"
+        
+        # Add to transcript
+        add_to_transcript(session_id, "assistant", decision["message"], "login_agent")
+        
+        return json.dumps(decision)
+
+# =====================================================
+# PROFILE AGENT (SMART SQL GENERATOR)
+# =====================================================
+
+class ProfileAgent:
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "profile_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the PROFILE SPECIALIST agent with SMART SQL GENERATION.
+
+YOUR JOB:
+- Create new profiles
+- Update existing profiles (weight, goals, any field)
+- Fetch and display profile data
+- GENERATE SQL QUERIES dynamically based on user requests
+
+DATABASE SCHEMA:
+user_profiles (
+  user_id, age, gender, height_cm, weight_kg, 
+  activity_level, diet_preference, 
+  health_goals TEXT[], health_conditions TEXT[]
+)
+
+SMART FEATURES:
+1. User says "update my weight to 70kg" → Generate: UPDATE user_profiles SET weight_kg = 70, updated_at = NOW() WHERE user_id = X
+2. User says "add diabetes to conditions" → Generate: UPDATE user_profiles SET health_conditions = array_append(health_conditions, 'Diabetes'), updated_at = NOW() WHERE user_id = X
+3. User says "show my profile" → Generate: SELECT * FROM user_profiles WHERE user_id = X
+4. User says "change my goal to muscle gain" → Generate: UPDATE user_profiles SET health_goals = ARRAY['Muscle Gain'], updated_at = NOW() WHERE user_id = X
+
+RESPONSE FORMAT:
+{{
+  "message": "response to user",
+  "action": "create" | "update" | "fetch" | "collecting",
+  "sql_query": "the SQL to execute",
+  "sql_params": [param1, param2],
+  "profile_data": {{...}}
+}}
+
+Be flexible and generate queries as needed!"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Profile Specialist (Smart SQL)",
+            "description": "Manages profiles with dynamic SQL generation",
+            "capabilities": ["Profile CRUD", "Dynamic SQL", "Smart updates"],
+            "database_access": ["user_profiles"]
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, a2a_message: A2AMessage) -> str:
+        session = a2a_message.metadata.get("session", {})
+        user_msg = a2a_message.metadata.get("original_user_message", "")
+        user_id = session.get("user_id")
+        session_id = a2a_message.metadata.get("session_id")
+        
+        # AUTHENTICATION CHECK - Profile Agent requires login
+        if not user_id:
+            error_msg = "🔒 Authentication required! Please login first to manage your profile."
+            add_to_transcript(session_id, "assistant", error_msg, "profile_agent")
+            return json.dumps({
+                "message": error_msg,
+                "action": "auth_error",
+                "requires_login": True
+            })
+        
+        context = f"""
+BOSS REQUEST: {a2a_message.content}
+USER SAID: {user_msg}
+USER_ID: {user_id}
+SESSION: {json.dumps(session)}
+"""
+        
+        response = await client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": context}
+            ],
+            temperature=0.7,
+            max_tokens=200
+        )
+        
+        result = response.choices[0].message.content
+        
+        try:
+            decision = json.loads(result)
+        except:
+            decision = {"message": result, "action": "collecting"}
+        
+        # Execute SQL if provided
+        if "sql_query" in decision and user_id:
+            try:
+                conn = await get_db()
+                sql = decision["sql_query"]
+                params = decision.get("sql_params", [])
+                
+                # Replace user_id placeholder
+                if "$user_id" in sql:
+                    sql = sql.replace("$user_id", str(user_id))
+                
+                if decision["action"] == "fetch":
+                    result_data = await conn.fetchrow(sql, *params)
+                    if result_data:
+                        decision["profile_data"] = dict(result_data)
+                        decision["message"] += f"\n\n📋 Your Profile:\n{json.dumps(dict(result_data), indent=2)}"
+                    else:
+                        decision["message"] = "No profile found. Would you like to create one?"
+                
+                elif decision["action"] in ["create", "update"]:
+                    await conn.execute(sql, *params)
+                    decision["message"] += "\n\n✅ Profile updated successfully!"
+                
+                await conn.close()
+                
+            except Exception as e:
+                decision["message"] = f"❌ Database error: {str(e)}"
+        
+        return json.dumps(decision)
+
+# =====================================================
+# HEALTH AGENT
+# =====================================================
+
+class HealthAgent:
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "health_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the HEALTH & WELLNESS EXPERT agent.
+
+YOUR JOB:
+- Answer questions about nutrition, diet, fitness, exercise, stress, sleep
+- Provide evidence-based health advice
+- Consider user's profile if available
+- Be supportive and motivational
+
+KNOWLEDGE AREAS:
+- Nutrition (calories, macros, meal planning)
+- Exercise (types, benefits, routines)
+- Stress management
+- Sleep hygiene
+- Weight management
+- Hydration
+
+RESPONSE FORMAT:
+{{
+  "message": "your expert advice",
+  "category": "nutrition" | "fitness" | "stress" | "sleep" | "general",
+  "personalized": true/false
+}}
+
+Be helpful, accurate, and encouraging!"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Health & Wellness Expert",
+            "description": "Provides health, nutrition, and fitness guidance",
+            "capabilities": ["Health Q&A", "Personalized advice", "Evidence-based tips"],
+            "requires_auth": True
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, a2a_message: A2AMessage) -> str:
+        session = a2a_message.metadata.get("session", {})
+        user_msg = a2a_message.metadata.get("original_user_message", "")
+        session_id = a2a_message.metadata.get("session_id")
+        
+        # AUTHENTICATION CHECK - Health Agent requires login
+        if not session.get("user_id"):
+            error_msg = "🔒 Authentication required! Please login first to get health advice."
+            add_to_transcript(session_id, "assistant", error_msg, "health_agent")
+            return json.dumps({
+                "message": error_msg,
+                "category": "auth_error",
+                "requires_login": True
+            })
+        
+        # Fetch user profile for personalization
+        profile_context = ""
+        if session.get("user_id"):
+            try:
+                conn = await get_db()
+                profile = await conn.fetchrow('''
+                    SELECT * FROM user_profiles WHERE user_id = $1
+                ''', session["user_id"])
+                await conn.close()
+                
+                if profile:
+                    profile_context = f"\n\nUSER PROFILE: {json.dumps(dict(profile), indent=2)}"
+            except:
+                pass
+        
+        context = f"""
+BOSS REQUEST: {a2a_message.content}
+USER QUESTION: {user_msg}
+{profile_context}
+"""
+        
+        response = await client.chat.completions.create(
+            model="openai/gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": context}
+            ],
+            temperature=0.7,
+            max_tokens=200
+        )
+        
+        result = response.choices[0].message.content
+        
+        try:
+            decision = json.loads(result)
+        except:
+            decision = {"message": result, "category": "general"}
+        
+        return json.dumps(decision)
+
+# =====================================================
+# LOGOUT AGENT
+# =====================================================
+
+class LogoutAgent:
+    def __init__(self, channel: A2AChannel):
+        self.agent_id = "logout_agent"
+        self.channel = channel
+        
+        self.system_prompt = """You are the LOGOUT SPECIALIST agent.
+
+YOUR JOB:
+- Handle logout requests
+- Delete session from database
+- Provide friendly goodbye message
+
+RESPONSE FORMAT:
+{{
+  "message": "goodbye message",
+  "action": "logout",
+  "session_deleted": true/false
+}}"""
+
+        self.card = {
+            "agent_id": self.agent_id,
+            "name": "Logout Specialist",
+            "description": "Handles user logout",
+            "capabilities": ["Session termination", "Goodbye messages"],
+            "database_access": ["sessions"]
+        }
+        channel.register_agent(self.agent_id, self.card)
+    
+    async def process(self, a2a_message: A2AMessage) -> str:
+        session = a2a_message.metadata.get("session", {})
+        session_id = session.get("session_id")
+        
+        decision = {
+            "message": "Goodbye! Come back soon. 👋",
+            "action": "logout",
+            "session_deleted": False
+        }
+        
+        if session_id:
+            try:
+                conn = await get_db()
+                await conn.execute('''
+                    DELETE FROM sessions WHERE session_id = $1
+                ''', session_id)
+                await conn.close()
+                
+                decision["session_deleted"] = True
+                decision["message"] = "✅ You've been logged out successfully. Take care! 👋"
+            except Exception as e:
+                decision["message"] = f"Logout completed (error: {str(e)})"
+        
+        return json.dumps(decision)
+
+# =====================================================
+# INITIALIZE ALL AGENTS
+# =====================================================
+
+main_agent = MainAgent(a2a_channel)
+registration_agent = RegistrationAgent(a2a_channel)
+login_agent = LoginAgent(a2a_channel)
+profile_agent = ProfileAgent(a2a_channel)
+health_agent = HealthAgent(a2a_channel)
+logout_agent = LogoutAgent(a2a_channel)
+
+# Map agents
+AGENTS = {
+    "registration_agent": registration_agent,
+    "login_agent": login_agent,
+    "profile_agent": profile_agent,
+    "health_agent": health_agent,
+    "logout_agent": logout_agent
+}
+
+# =====================================================
+# HTML UI
+# =====================================================
+
+HTML_UI = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ABC+ Fit Banker - AI Health Assistant</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #ffffff;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem 2rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .header-subtitle {
+            font-size: 0.875rem;
+            opacity: 0.9;
+            margin-top: 0.25rem;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(255,255,255,0.2);
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.875rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-width: 1200px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 2rem;
+            overflow: hidden;
+        }
+
+        .chat-container {
+            flex: 1;
+            background: #f8f9fa;
+            border-radius: 16px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .message {
+            display: flex;
+            gap: 1rem;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-size: 1.25rem;
+        }
+
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 1rem 1.25rem;
+            border-radius: 16px;
+            line-height: 1.6;
+        }
+
+        .message.assistant .message-content {
+            background: white;
+            color: #1f2937;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .message-time {
+            font-size: 0.75rem;
+            opacity: 0.6;
+            margin-top: 0.5rem;
+        }
+
+        .agent-badge {
+            display: inline-block;
+            background: #f3f4f6;
+            color: #6b7280;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            margin-top: 0.5rem;
+        }
+
+        .typing-indicator {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem 0;
+        }
+
+        .typing-indicator .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .typing-dots {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 1rem 1.25rem;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #9ca3af;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+            }
+            30% {
+                transform: translateY(-10px);
+            }
+        }
+
+        .input-container {
+            padding: 1.5rem;
+            background: white;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .input-wrapper {
+            display: flex;
+            gap: 1rem;
+            align-items: flex-end;
+        }
+
+        .input-box {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .quick-actions {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .quick-btn {
+            padding: 0.5rem 1rem;
+            background: #f3f4f6;
+            border: none;
+            border-radius: 20px;
+            font-size: 0.875rem;
+            color: #6b7280;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .quick-btn:hover {
+            background: #e5e7eb;
+            color: #374151;
+        }
+
+        #messageInput {
+            width: 100%;
+            padding: 1rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-family: inherit;
+            resize: none;
+            transition: border-color 0.2s;
+        }
+
+        #messageInput:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        #sendBtn {
+            padding: 1rem 2rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        #sendBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        #sendBtn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            background: rgba(255,255,255,0.2);
+            border-radius: 12px;
+        }
+
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+
+            .header {
+                padding: 1rem;
+            }
+
+            .header-content {
+                flex-direction: column;
+                gap: 1rem;
+                align-items: flex-start;
+            }
+
+            .message-content {
+                max-width: 85%;
+            }
+
+            .input-wrapper {
+                flex-direction: column;
+            }
+
+            #sendBtn {
+                width: 100%;
+            }
+        }
+
+        .messages::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .messages::-webkit-scrollbar-thumb {
+            background: #d1d5db;
+            border-radius: 4px;
+        }
+
+        .messages::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <div>
+                <h1>🏥 ABC+ Fit Banker</h1>
+                <div class="header-subtitle">Your AI-Powered Health & Wellness Assistant</div>
+            </div>
+            <div style="display: flex; gap: 1rem; align-items: center;">
+                <div class="status-badge">
+                    <div class="status-dot"></div>
+                    <span id="statusText">Online</span>
+                </div>
+                <div id="userInfo" style="display: none;" class="user-info">
+                    <div class="user-avatar">👤</div>
+                    <span id="userName"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="chat-container">
+            <div class="messages" id="messages">
+                <div class="message assistant">
+                    <div class="message-avatar">🤖</div>
+                    <div>
+                        <div class="message-content">
+                            Hi! 👋 Welcome to ABC+ Fit Banker. I'm your AI health assistant powered by intelligent agents.
+                            <br><br>
+                            I can help you with:
+                            <br>• Creating a new account
+                            <br>• Logging in to your account
+                            <br>• Setting up your health profile
+                            <br>• Answering health & nutrition questions
+                            <br><br>
+                            What would you like to do today?
+                        </div>
+                        <div class="message-time" id="initialTime"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="input-container">
+                <div class="input-box">
+                    <div class="quick-actions">
+                        <button class="quick-btn" onclick="sendQuick('I want to register')">📝 Register</button>
+                        <button class="quick-btn" onclick="sendQuick('I want to login')">🔐 Login</button>
+                        <button class="quick-btn" onclick="sendQuick('Help me')">❓ Help</button>
+                        <button class="quick-btn" id="profileBtn" style="display: none;" onclick="sendQuick('Show my profile')">👤 My Profile</button>
+                        <button class="quick-btn" id="logoutBtn" style="display: none;" onclick="sendQuick('Logout')">🚪 Logout</button>
+                    </div>
+                    <div class="input-wrapper">
+                        <textarea 
+                            id="messageInput" 
+                            placeholder="Type your message here... (e.g., 'I want to signup' or 'What's a good diet?')"
+                            rows="2"
+                        ></textarea>
+                        <button id="sendBtn" onclick="sendMessage()">
+                            Send 🚀
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let sessionId = localStorage.getItem('sessionId') || null;
+        let userId = localStorage.getItem('userId') || null;
+        let userName = localStorage.getItem('userName') || null;
+
+        // Initialize
+        document.getElementById('initialTime').textContent = new Date().toLocaleTimeString();
+        
+        if (userId && userName) {
+            updateUserInfo(userName, userId);
+        }
+
+        // Handle Enter key
+        document.getElementById('messageInput').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        function updateUserInfo(name, id) {
+            document.getElementById('userName').textContent = name;
+            document.getElementById('userInfo').style.display = 'flex';
+            document.getElementById('profileBtn').style.display = 'block';
+            document.getElementById('logoutBtn').style.display = 'block';
+            localStorage.setItem('userName', name);
+            localStorage.setItem('userId', id);
+        }
+
+        function clearUserInfo() {
+            document.getElementById('userInfo').style.display = 'none';
+            document.getElementById('profileBtn').style.display = 'none';
+            document.getElementById('logoutBtn').style.display = 'none';
+            localStorage.removeItem('sessionId');
+            localStorage.removeItem('userId');
+            localStorage.removeItem('userName');
+            sessionId = null;
+            userId = null;
+            userName = null;
+        }
+
+        function sendQuick(message) {
+            document.getElementById('messageInput').value = message;
+            sendMessage();
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (!message) return;
+
+            // Disable input
+            input.disabled = true;
+            document.getElementById('sendBtn').disabled = true;
+
+            // Add user message
+            addMessage('user', message);
+            input.value = '';
+
+            // Show typing indicator
+            showTyping();
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        session_id: sessionId
+                    })
+                });
+
+                const data = await response.json();
+                
+                // Hide typing
+                hideTyping();
+
+                // Update session
+                if (data.session_id) {
+                    sessionId = data.session_id;
+                    localStorage.setItem('sessionId', sessionId);
+                }
+
+                if (data.user_id) {
+                    userId = data.user_id;
+                    // Extract name from response if available
+                    if (data.response.includes('Welcome back')) {
+                        const nameMatch = data.response.match(/Welcome back,\\s*([^!]+)/);
+                        if (nameMatch) {
+                            updateUserInfo(nameMatch[1].trim(), userId);
+                        }
+                    }
+                }
+
+                // Handle logout
+                if (data.logout) {
+                    clearUserInfo();
+                }
+
+                // Add bot response
+                addMessage('assistant', data.response, data.routed_to);
+
+            } catch (error) {
+                hideTyping();
+                addMessage('assistant', '❌ Sorry, something went wrong. Please try again.');
+                console.error('Error:', error);
+            } finally {
+                input.disabled = false;
+                document.getElementById('sendBtn').disabled = false;
+                input.focus();
+            }
+        }
+
+        function addMessage(role, content, agent = null) {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            const avatar = role === 'user' ? '👤' : '🤖';
+            const time = new Date().toLocaleTimeString();
+            
+            let agentBadge = '';
+            if (agent) {
+                const agentNames = {
+                    'registration_agent': '📝 Registration',
+                    'login_agent': '🔐 Login',
+                    'profile_agent': '👤 Profile',
+                    'health_agent': '💊 Health Expert',
+                    'logout_agent': '🚪 Logout'
+                };
+                agentBadge = `<div class="agent-badge">${agentNames[agent] || agent}</div>`;
+            }
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar">${avatar}</div>
+                <div>
+                    <div class="message-content">${content.replace(/\\n/g, '<br>')}</div>
+                    ${agentBadge}
+                    <div class="message-time">${time}</div>
+                </div>
+            `;
+            
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function showTyping() {
+            const messagesDiv = document.getElementById('messages');
+            const typingDiv = document.createElement('div');
+            typingDiv.id = 'typingIndicator';
+            typingDiv.className = 'typing-indicator';
+            typingDiv.innerHTML = `
+                <div class="message-avatar">🤖</div>
+                <div class="typing-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            `;
+            messagesDiv.appendChild(typingDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function hideTyping() {
+            const typingDiv = document.getElementById('typingIndicator');
+            if (typingDiv) {
+                typingDiv.remove();
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+# =====================================================
+# API ROUTES
+# =====================================================
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: Optional[str] = None
+    user_id: Optional[int] = None
+    routed_to: Optional[str] = None
+    logout: Optional[bool] = False
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the HTML UI"""
+    return HTML_UI
+
+@app.on_event("startup")
+async def startup():
+    """Initialize system on startup"""
+    print("=" * 60)
+    print("🚀 ABC+ Fit Banker AI Authentication System")
+    print("=" * 60)
+    print(f"✓ OpenRouter AI: Connected")
+    print(f"✓ Database: {DB_NAME}@{DB_HOST}:{DB_PORT}")
+    await init_db()
+    print(f"✓ Agents: {len(a2a_channel.agent_cards)} registered")
+    print("=" * 60)
+    print("✅ System Ready!")
+    print("🌐 Open: http://localhost:8000")
+    print("=" * 60)
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Main chat endpoint - intelligent agent collaboration system"""
+    
+    # Get session data
+    session_data = await get_user_from_session(request.session_id)
+    print(f"\n🔍 Session Check: session_id={request.session_id}, user_data={session_data}")
+    
+    # Main agent processes (THE BOSS)
+    result = await main_agent.process(request.message, session_data or {}, request.session_id)
+    
+    # If routed to specialist - start intelligent agent conversation
+    if result.get("wait_for_response"):
+        agent_id = result["routed_to"]
+        
+        # Multi-step agent conversation loop
+        max_agent_steps = 5  # Prevent infinite loops
+        conversation_steps = 0
+        
+        while conversation_steps < max_agent_steps:
+            # Get A2A messages for current agent
+            messages = a2a_channel.get_messages(agent_id)
+            
+            if messages and agent_id in AGENTS:
+                print(f"\n🤖 AGENT {agent_id.upper()} PROCESSING...")
+                
+                # Add conversation context for smarter agents
+                messages[0].metadata["agent_conversation_history"] = a2a_channel.get_conversation_context(agent_id)
+                
+                # Specialist processes with full context
+                specialist_response = await AGENTS[agent_id].process(messages[0])
+                print(f"✅ AGENT {agent_id.upper()} COMPLETED")
+                
+                # Parse agent response
+                try:
+                    response_data = json.loads(specialist_response)
+                except:
+                    response_data = {"message": specialist_response, "status": "completed"}
+                
+                # Check if agent needs to collaborate with another agent
+                if response_data.get("collaborate_with"):
+                    # Agent wants to talk to another agent
+                    target_agent = response_data["collaborate_with"]
+                    collaboration_msg = A2AMessage(
+                        sender=agent_id,
+                        receiver=target_agent,
+                        content=response_data.get("collaboration_message", "Need assistance"),
+                        metadata={
+                            "session": session_data,
+                            "original_user_message": request.message,
+                            "session_id": request.session_id,
+                            "collaboration": True
+                        }
+                    )
+                    await a2a_channel.send(collaboration_msg)
+                    agent_id = target_agent
+                    conversation_steps += 1
+                    continue
+                
+                # Check if agent completed task or needs more info
+                if (response_data.get("status") in ["completed", "created", "success", "failed"] or
+                    response_data.get("action") in ["completed", "logout"] or
+                    "requires_login" in response_data):
+                    # Agent finished - return result to user
+                    break
+                elif response_data.get("status") in ["collecting", "verifying"]:
+                    # Agent needs more user input - break and ask user
+                    break
+                else:
+                    # Continue conversation if needed
+                    conversation_steps += 1
+            else:
+                break
+        
+        # Extract final response for user - ensure clean message
+        try:
+            response_data = json.loads(specialist_response)
+            user_message = response_data.get("message", "Processing complete.")
+            
+            # Don't show raw JSON to user - extract clean message only
+            if isinstance(user_message, dict) or user_message.startswith("{"):
+                user_message = "Task completed successfully!"
+        except:
+            user_message = specialist_response
+        
+        # Handle special cases
+        if agent_id == "logout_agent" and response_data.get("session_deleted"):
+            return ChatResponse(
+                response=user_message,
+                session_id=None,
+                user_id=None,
+                logout=True
+            )
+        
+        # Handle login success
+        new_session = response_data.get("session_id", request.session_id)
+        new_user_id = response_data.get("user_id", session_data.get("user_id") if session_data else None)
+        
+        # Add final response to transcript
+        add_to_transcript(request.session_id, "assistant", user_message, agent_id)
+        
+        # Return clean response to user (hide agent complexity)
+        return ChatResponse(
+            response=user_message,
+            session_id=new_session,
+            user_id=new_user_id,
+            routed_to=None  # Hide internal agent routing
+        )
+    
+    # Direct response from main agent
+    return ChatResponse(
+        response=result.get("response", "How can I help?"),
+        session_id=request.session_id,
+        user_id=session_data.get("user_id") if session_data else None
+    )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "agents": len(a2a_channel.agent_cards),
+        "agent_list": list(a2a_channel.agent_cards.keys()),
+        "database": f"{DB_NAME}@{DB_HOST}",
+        "ai_provider": "OpenRouter AI"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
